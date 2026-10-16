@@ -1,0 +1,20 @@
+# Copy to deployment.conf and edit. This is a trusted Bash configuration file.
+SSH_SOURCE_CIDR=192.168.30.1/32
+TIMEZONE=America/New_York
+LOCALE=en_US.UTF-8
+
+# Optional: restrict SSH logins to this existing account and source address.
+# Temporary root access used for inspection is deliberately excluded.
+CONFIGURE_SSH=0
+SSH_USER=hayden
+SSH_SOURCE_HOST=192.168.30.1
+
+# Optional: stage static networking for the NEXT BOOT. Use a unique address.
+CONFIGURE_NETWORK=0
+INTERFACE=ens18
+ADDRESS_CIDR=
+GATEWAY=192.168.30.1
+DNS_SERVERS=192.168.30.1
+DNS_SEARCH=conleylabs.com
+HOSTNAME=
+
