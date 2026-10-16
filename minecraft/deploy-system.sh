@@ -52,10 +52,14 @@ PY
 fi
 cat <<EOF
 Target: this Debian 13 VM
-Packages: iptables, openssh-server, qemu-guest-agent, curl, sudo, vim, locales, tzdata
+Packages: iptables, openssh-server, qemu-guest-agent, curl, wget, ca-certificates, sudo, vim, locales, tzdata, openjdk-25-jdk-headless
 Timezone: $TIMEZONE; locale: $LOCALE
 IPv4: drop inbound TCP 25/465/587; allow SSH from $SSH_SOURCE_CIDR, drop other SSH
 Persist the custom IPv4 rules through a dedicated systemd service.
+Create minecraft user/group, home /home/minecraft, shell /bin/bash.
+Ensure /opt/minecraft is owned by minecraft:minecraft with mode 0750.
+Download the specified Mojang JAR to /opt/minecraft/server.jar (SHA-1 verified).
+Enable minecraft.service at boot (4 GB heap), launch, accept EULA, then restart.
 Configure SSH account restriction: $CONFIGURE_SSH
 Stage static networking and hostname for next boot: $CONFIGURE_NETWORK
 EOF
@@ -63,14 +67,15 @@ EOF
 [[ $EUID == 0 ]] || { echo 'Run --apply as root.' >&2; exit 1; }
 source /etc/os-release
 [[ $ID == debian && $VERSION_ID == 13 ]] || { echo 'Requires Debian 13.' >&2; exit 1; }
+[[ $(dpkg --print-architecture) == amd64 ]] || { echo 'This Java service baseline requires amd64.' >&2; exit 1; }
 backup_dir=/var/backups/conleylabs/$(date +%Y%m%dT%H%M%S)-$$
 mkdir -p "$backup_dir"
 chmod 700 "$backup_dir"
 backup() { if [[ -e $1 ]]; then cp -a --parents -- "$1" "$backup_dir/"; fi; }
-for path in /etc/conleylabs /usr/local/sbin/conleylabs-firewall /etc/systemd/system/conleylabs-firewall.service; do backup "$path"; done
+for path in /etc/conleylabs /usr/local/sbin/conleylabs-firewall /etc/systemd/system/conleylabs-firewall.service /etc/systemd/system/minecraft.service; do backup "$path"; done
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y iptables openssh-server qemu-guest-agent curl sudo vim locales tzdata
+apt-get install -y iptables openssh-server qemu-guest-agent curl wget ca-certificates sudo vim locales tzdata openjdk-25-jdk-headless
 iptables --version | grep -q nf_tables || { echo 'Expected iptables nft backend.' >&2; exit 1; }
 iptables -S INPUT | head -n 1 | grep -qx -- '-P INPUT ACCEPT' || {
     echo 'Expected INPUT policy ACCEPT, as on the example. Review existing firewall first.' >&2; exit 1;
@@ -83,6 +88,45 @@ timedatectl set-timezone "$TIMEZONE"
 sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
 locale-gen
 update-locale LANG="$LOCALE"
+# Match the example's account layout without pinning host-specific UID/GID 1001.
+if [[ -L /opt/minecraft || ( -e /opt/minecraft && ! -d /opt/minecraft ) ]]; then
+    echo '/opt/minecraft must be a directory, not a symlink or other file.' >&2
+    exit 1
+fi
+if ! getent group minecraft >/dev/null; then
+    groupadd minecraft
+fi
+if ! getent passwd minecraft >/dev/null; then
+    useradd --create-home --home-dir /home/minecraft --shell /bin/bash --gid minecraft minecraft
+elif [[ $(id -gn minecraft) != minecraft ||
+        $(getent passwd minecraft | cut -d: -f6-7) != /home/minecraft:/bin/bash ]]; then
+    echo 'Existing minecraft account differs from expected primary group, home, or shell; review it before deployment.' >&2
+    exit 1
+fi
+# Do not recursively change existing worlds or other application files.
+install -d -o minecraft -g minecraft -m 0750 /opt/minecraft
+server_url=https://piston-data.mojang.com/v1/objects/33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c/server.jar
+server_sha1=33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c
+server_jar=/opt/minecraft/server.jar
+if [[ -L $server_jar || ( -e $server_jar && ! -f $server_jar ) ]]; then
+    echo 'server.jar must be a regular file, not a symlink or other file.' >&2
+    exit 1
+fi
+if [[ ! -f $server_jar ]] || ! printf '%s  %s\n' "$server_sha1" "$server_jar" | sha1sum --check --status; then
+    download_dir=$(mktemp -d)
+    trap 'rm -rf -- "$download_dir"' EXIT
+    wget --https-only --timeout=30 --tries=3 -O "$download_dir/server.jar" "$server_url"
+    printf '%s  %s\n' "$server_sha1" "$download_dir/server.jar" | sha1sum --check --status || {
+        echo 'Minecraft JAR checksum verification failed; existing server.jar preserved.' >&2
+        exit 1
+    }
+    backup "$server_jar"
+    install -o minecraft -g minecraft -m 0664 "$download_dir/server.jar" "$server_jar"
+else
+    chown minecraft:minecraft "$server_jar"
+    chmod 0664 "$server_jar"
+fi
+install -m 644 "$base/minecraft.service" /etc/systemd/system/minecraft.service
 install -d -m 755 /etc/conleylabs
 printf 'SSH_SOURCE_CIDR=%q\n' "$SSH_SOURCE_CIDR" > /etc/conleylabs/firewall.conf
 chmod 644 /etc/conleylabs/firewall.conf
@@ -161,4 +205,32 @@ if [[ -e /dev/virtio-ports/org.qemu.guest_agent.0 ]]; then
 else
     echo 'QEMU guest agent installed; enable its channel in Proxmox to use it.'
 fi
+systemctl enable minecraft.service
+eula=/opt/minecraft/eula.txt
+if [[ -L $eula || ( -e $eula && ! -f $eula ) ]]; then
+    echo 'eula.txt must be a regular file, not a symlink or other file.' >&2
+    exit 1
+fi
+if ! grep -Eq $'^eula=true\r?$' "$eula" 2>/dev/null; then
+    # The initial launch generates eula.txt and normally exits until accepted.
+    systemctl start minecraft.service
+    for ((attempt=0; attempt<90; attempt++)); do
+        if [[ -f $eula ]] && grep -Eq $'^eula=(false|true)\r?$' "$eula"; then
+            break
+        fi
+        sleep 1
+    done
+    systemctl stop minecraft.service
+    if [[ -L $eula ]] || ! grep -Eq $'^eula=(false|true)\r?$' "$eula" 2>/dev/null; then
+        echo 'Minecraft did not generate a valid eula.txt within 90 seconds; service stopped.' >&2
+        journalctl -u minecraft.service -n 30 --no-pager >&2
+        exit 1
+    fi
+    backup "$eula"
+    sed -i 's/^eula=false\r\?$/eula=true/' "$eula"
+    chown minecraft:minecraft "$eula"
+fi
+systemctl restart minecraft.service
+echo 'Minecraft service started and enabled at boot; EULA accepted.'
+echo 'Check startup progress with: journalctl -u minecraft.service -f'
 echo "System configuration applied. File backups: $backup_dir"
